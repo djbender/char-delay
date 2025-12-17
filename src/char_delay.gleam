@@ -55,11 +55,12 @@ fn update(model: Model, msg: Msg) -> Model {
     CharKeyDown(key, timestamp) ->
       Model(
         ..model,
-        pending_chars: list.append(model.pending_chars, [PendingChar(key, timestamp)]),
+        pending_chars: list.append(model.pending_chars, [
+          PendingChar(key, timestamp),
+        ]),
       )
 
-    DeleteKeyDown(timestamp) ->
-      Model(..model, last_event_time: Some(timestamp))
+    DeleteKeyDown(timestamp) -> Model(..model, last_event_time: Some(timestamp))
 
     IgnoredKeyDown -> model
 
@@ -88,10 +89,17 @@ fn update(model: Model, msg: Msg) -> Model {
         // Text same or shrunk with pending char (select + replace)
         order.Eq, [first, ..] | order.Lt, [first, ..] -> {
           let new_keystroke =
-            Keystroke(char: first.key, timestamp: first.timestamp, baseline: first.timestamp)
+            Keystroke(
+              char: first.key,
+              timestamp: first.timestamp,
+              baseline: first.timestamp,
+            )
           let chars_to_drop = old_len - new_len + 1
           Model(
-            keystrokes_rev: [new_keystroke, ..list.drop(model.keystrokes_rev, chars_to_drop)],
+            keystrokes_rev: [
+              new_keystroke,
+              ..list.drop(model.keystrokes_rev, chars_to_drop)
+            ],
             pending_chars: list.drop(model.pending_chars, 1),
             last_event_time: Some(first.timestamp),
             text: new_text,
@@ -128,7 +136,8 @@ fn consume_pending_rev(
     list.fold(to_consume, #([], last_event), fn(acc, p) {
       let #(new_ks_list, baseline_opt) = acc
       let baseline = option.unwrap(baseline_opt, p.timestamp)
-      let new_ks = Keystroke(char: p.key, timestamp: p.timestamp, baseline: baseline)
+      let new_ks =
+        Keystroke(char: p.key, timestamp: p.timestamp, baseline: baseline)
       #([new_ks, ..new_ks_list], Some(p.timestamp))
     })
   // new_keystrokes is in reverse order of to_consume, prepend to keystrokes_rev
@@ -139,7 +148,8 @@ fn consume_pending_rev(
 
 fn compute_delays(keystrokes: List(Keystroke)) -> List(Float) {
   keystrokes
-  |> list.drop(1)  // First char has no delay
+  |> list.drop(1)
+  // First char has no delay
   |> list.map(fn(ks) { ks.timestamp -. ks.baseline })
 }
 
@@ -166,24 +176,24 @@ fn view(model: Model) -> Element(Msg) {
   let count_text = "Characters: " <> int.to_string(char_count)
 
   html.main([], [
-      html.h1([], [element.text("Keystroke Delay Calculator")]),
-      html.textarea(
-        [
-          attribute.id("input"),
-          attribute.placeholder("Start typing here..."),
-          attribute.attribute("rows", "6"),
-          attribute.value(model.text),
-          event.on("keydown", decode_keydown()),
-          event.on_input(TextChanged),
-        ],
-        "",
-      ),
-      html.p([], [element.text(avg_text)]),
-      html.p([], [element.text(count_text)]),
-      html.button([event.on_click(Reset)], [element.text("Reset")]),
-      html.h2([], [element.text("Keystroke Log")]),
-      html.pre([], [element.text(format_keystrokes(keystrokes))]),
-    ])
+    html.h1([], [element.text("Keystroke Delay Calculator")]),
+    html.textarea(
+      [
+        attribute.id("input"),
+        attribute.placeholder("Start typing here..."),
+        attribute.attribute("rows", "6"),
+        attribute.value(model.text),
+        event.on("keydown", decode_keydown()),
+        event.on_input(TextChanged),
+      ],
+      "",
+    ),
+    html.p([], [element.text(avg_text)]),
+    html.p([], [element.text(count_text)]),
+    html.button([event.on_click(Reset)], [element.text("Reset")]),
+    html.h2([], [element.text("Keystroke Log")]),
+    html.pre([], [element.text(format_keystrokes(keystrokes))]),
+  ])
 }
 
 fn format_keystrokes(keystrokes: List(Keystroke)) -> String {

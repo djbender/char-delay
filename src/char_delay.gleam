@@ -1,8 +1,9 @@
 import gleam/dynamic/decode
-import gleam/int
 import gleam/float
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/string
 import lustre
 import lustre/attribute
@@ -27,9 +28,10 @@ type PendingChar {
 
 type Model {
   Model(
-    keystrokes: List(Keystroke),
-    /// Pending char from keydown
-    pending_char: Option(PendingChar),
+    /// Keystrokes in reverse order (newest first) for O(1) prepend
+    keystrokes_rev: List(Keystroke),
+    /// Queue of pending chars from keydown events
+    pending_chars: List(PendingChar),
     /// Last event time (char or backspace) - baseline for next char
     last_event_time: Option(Float),
     text: String,
@@ -37,7 +39,7 @@ type Model {
 }
 
 fn init(_flags) -> Model {
-  Model(keystrokes: [], pending_char: None, last_event_time: None, text: "")
+  Model(keystrokes_rev: [], pending_chars: [], last_event_time: None, text: "")
 }
 
 type Msg {
@@ -51,7 +53,10 @@ type Msg {
 fn update(model: Model, msg: Msg) -> Model {
   case msg {
     CharKeyDown(key, timestamp) ->
-      Model(..model, pending_char: Some(PendingChar(key, timestamp)))
+      Model(
+        ..model,
+        pending_chars: list.append(model.pending_chars, [PendingChar(key, timestamp)]),
+      )
 
     DeleteKeyDown(timestamp) ->
       Model(..model, last_event_time: Some(timestamp))
@@ -61,30 +66,45 @@ fn update(model: Model, msg: Msg) -> Model {
     TextChanged(new_text) -> {
       let old_len = string.length(model.text)
       let new_len = string.length(new_text)
+      let added = new_len - old_len
 
-      case new_len > old_len, model.pending_char {
-        // Text grew and we have a pending char
-        True, Some(pending) -> {
-          let baseline = option.unwrap(model.last_event_time, 0.0)
-          let new_keystroke =
-            Keystroke(char: pending.key, timestamp: pending.timestamp, baseline: baseline)
-          let added = new_len - old_len
-          let new_keystrokes = add_keystrokes(model.keystrokes, new_keystroke, added)
+      case int.compare(new_len, old_len), model.pending_chars {
+        // Text grew and we have pending chars - consume from queue
+        order.Gt, [_, ..] -> {
+          let #(new_keystrokes_rev, last_ts) =
+            consume_pending_rev(
+              model.keystrokes_rev,
+              model.pending_chars,
+              model.last_event_time,
+              added,
+            )
           Model(
-            keystrokes: new_keystrokes,
-            pending_char: None,
-            last_event_time: Some(pending.timestamp),
+            keystrokes_rev: new_keystrokes_rev,
+            pending_chars: list.drop(model.pending_chars, added),
+            last_event_time: Some(last_ts),
             text: new_text,
           )
         }
-        // Text grew but no pending char (e.g., paste) - ignore
-        True, None -> Model(..model, text: new_text)
-        // Text shrunk - truncate keystrokes (last_event_time already set by DeleteKeyDown)
-        False, _ -> {
+        // Text same or shrunk with pending char (select + replace)
+        order.Eq, [first, ..] | order.Lt, [first, ..] -> {
+          let new_keystroke =
+            Keystroke(char: first.key, timestamp: first.timestamp, baseline: first.timestamp)
+          let chars_to_drop = old_len - new_len + 1
+          Model(
+            keystrokes_rev: [new_keystroke, ..list.drop(model.keystrokes_rev, chars_to_drop)],
+            pending_chars: list.drop(model.pending_chars, 1),
+            last_event_time: Some(first.timestamp),
+            text: new_text,
+          )
+        }
+        // Text grew but no pending chars (e.g., paste) - ignore
+        order.Gt, [] -> Model(..model, text: new_text)
+        // Text same or shrunk without pending - truncate (drop from head)
+        _, [] -> {
+          let chars_to_drop = old_len - new_len
           Model(
             ..model,
-            keystrokes: list.take(model.keystrokes, new_len),
-            pending_char: None,
+            keystrokes_rev: list.drop(model.keystrokes_rev, chars_to_drop),
             text: new_text,
           )
         }
@@ -95,14 +115,26 @@ fn update(model: Model, msg: Msg) -> Model {
   }
 }
 
-fn add_keystrokes(keystrokes: List(Keystroke), ks: Keystroke, n: Int) -> List(Keystroke) {
-  case n <= 0 {
-    True -> keystrokes
-    False -> {
-      let new_entries = list.repeat(ks, n)
-      list.append(keystrokes, new_entries)
-    }
-  }
+/// Consume up to n pending chars, prepending to reversed keystrokes list
+fn consume_pending_rev(
+  keystrokes_rev: List(Keystroke),
+  pending: List(PendingChar),
+  last_event: Option(Float),
+  n: Int,
+) -> #(List(Keystroke), Float) {
+  let to_consume = list.take(pending, n)
+  // Process pending chars, building up the new keystrokes
+  let #(new_keystrokes, final_baseline) =
+    list.fold(to_consume, #([], last_event), fn(acc, p) {
+      let #(new_ks_list, baseline_opt) = acc
+      let baseline = option.unwrap(baseline_opt, p.timestamp)
+      let new_ks = Keystroke(char: p.key, timestamp: p.timestamp, baseline: baseline)
+      #([new_ks, ..new_ks_list], Some(p.timestamp))
+    })
+  // new_keystrokes is in reverse order of to_consume, prepend to keystrokes_rev
+  let result = list.append(new_keystrokes, keystrokes_rev)
+  let last_ts = option.unwrap(final_baseline, 0.0)
+  #(result, last_ts)
 }
 
 fn compute_delays(keystrokes: List(Keystroke)) -> List(Float) {
@@ -124,20 +156,16 @@ fn average_delay(keystrokes: List(Keystroke)) -> Option(Float) {
 }
 
 fn view(model: Model) -> Element(Msg) {
-  let avg = average_delay(model.keystrokes)
+  let keystrokes = list.reverse(model.keystrokes_rev)
+  let avg = average_delay(keystrokes)
   let avg_text = case avg {
     None -> "Type to measure..."
     Some(ms) -> "Avg delay: " <> float_to_string(ms) <> " ms"
   }
-  let char_count = list.length(model.keystrokes)
+  let char_count = list.length(keystrokes)
   let count_text = "Characters: " <> int.to_string(char_count)
 
-  html.div([], [
-    html.link([
-      attribute.rel("stylesheet"),
-      attribute.href("https://cdn.simplecss.org/simple.min.css"),
-    ]),
-    html.main([], [
+  html.main([], [
       html.h1([], [element.text("Keystroke Delay Calculator")]),
       html.textarea(
         [
@@ -154,9 +182,8 @@ fn view(model: Model) -> Element(Msg) {
       html.p([], [element.text(count_text)]),
       html.button([event.on_click(Reset)], [element.text("Reset")]),
       html.h2([], [element.text("Keystroke Log")]),
-      html.pre([], [element.text(format_keystrokes(model.keystrokes))]),
-    ]),
-  ])
+      html.pre([], [element.text(format_keystrokes(keystrokes))]),
+    ])
 }
 
 fn format_keystrokes(keystrokes: List(Keystroke)) -> String {
@@ -187,8 +214,16 @@ fn decode_keydown() -> decode.Decoder(Msg) {
     _ ->
       case is_ignored_key(key) {
         True -> decode.success(IgnoredKeyDown)
-        False -> decode.success(CharKeyDown(key, timestamp))
+        False -> decode.success(CharKeyDown(normalize_key(key), timestamp))
       }
+  }
+}
+
+fn normalize_key(key: String) -> String {
+  case key {
+    "Enter" -> "\\n"
+    "Tab" -> "\\t"
+    _ -> key
   }
 }
 
@@ -201,7 +236,7 @@ fn is_ignored_key(key: String) -> Bool {
     "Shift" | "Control" | "Alt" | "Meta" -> True
     "CapsLock" | "NumLock" | "ScrollLock" -> True
     // Function keys
-    "Escape" | "Tab" -> True
+    "Escape" -> True
     "F1" | "F2" | "F3" | "F4" | "F5" | "F6" -> True
     "F7" | "F8" | "F9" | "F10" | "F11" | "F12" -> True
     // Other non-character keys
